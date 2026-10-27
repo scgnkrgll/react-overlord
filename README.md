@@ -3,22 +3,26 @@
 [![npm](https://img.shields.io/npm/v/react-overlord)](https://www.npmjs.com/package/react-overlord)
 [![JSR](https://jsr.io/badges/@scgnkrgll/react-overlord)](https://jsr.io/@scgnkrgll/react-overlord)
 
-A type-safe, headless manager for modals, drawers, context menus, toasts and anything else that floats above your app.
+A type-safe, headless manager for modals, drawers, context menus and other overlays that render above your app.
 
-- **Fully typed.** `open()` knows the overlay's props and what it submits. `useOverlay()` knows the same types.
-- **Async work without losing input.** While the caller's `onSubmit` runs, the overlay stays open and can disable itself. If it fails, the overlay stays open with the user's input intact and shows the error, so the user can retry.
-- **One way to do each thing.** Open with `Handle.open()`, or `Handle.openAsync()` to `await` the result. Finish with `submit()` or `dismiss()`. There are no aliases or alternative forms.
-- **Headless.** Bring your own UI (antd, MUI, plain HTML). The library only manages state and rendering.
+Use it when overlays are reused across an app, return data, or run async work that can fail.
+
+- **Typed end to end.** `open()` knows the overlay's props and the type it submits. `useOverlay()` knows the same types.
+- **Async work keeps the user's input.** While the caller's `onSubmit` runs, the overlay stays open and can disable itself. If `onSubmit` fails, the overlay stays open with the user's input and shows the error, so the user can retry.
+- **One way to do each thing.** Open with `Handle.open()`, or with `Handle.openAsync()` to `await` the result. Finish with `submit()` or `dismiss()`. There are no aliases.
+- **Headless.** You render the UI with antd, MUI or plain HTML. The library manages state and decides what is mounted.
 
 ## Install
 
 ```sh
-npm i react-overlord                    # npm / pnpm / yarn / bun
+npm i react-overlord                    # npm, pnpm, yarn or bun
 npx jsr add @scgnkrgll/react-overlord   # JSR
 deno add jsr:@scgnkrgll/react-overlord  # Deno
 ```
 
-Requires React 18 or later. The package ships with a `"use client"` directive, so it works in Next.js App Router.
+It requires React 18 or later. The package has a `"use client"` directive, so it works in the Next.js App Router.
+
+The manager is a module-level singleton. Call `open()` only from event handlers and effects. If you open an overlay during server-side rendering, every request shares that overlay state.
 
 ## Setup
 
@@ -27,30 +31,28 @@ Requires React 18 or later. The package ships with a `"use client"` directive, s
 import { createOverlayManager } from "react-overlord";
 
 export const overlays = createOverlayManager({
-  layers: {                                              // declaration order = render order (later draws on top)
-    modal: {},                                           // unlimited
+  layers: {                                              // later layers draw on top of earlier ones
+    modal: {},                                           // no limit
     menu:  { limit: 1, overflow: "dismiss-oldest" },     // a new menu replaces the old one
-    toast: { stack: true, limit: 24, container: ToastGroup },  // Ark-style pile, see "Stacked layers"
   },
 });
 ```
 
 ```tsx
-// App.tsx: mount once, inside your theme/router/query providers so overlays can use them
+// App.tsx: mount once, inside your theme, router and query providers so overlays can use them
 <ThemeProvider>
   <Routes />
   <overlays.Outlet />
 </ThemeProvider>
 ```
 
-A layer's rules apply across every overlay in it. For example, two different menu components can never be open at the same time.
+A layer's rules apply to every overlay in it. For example, two different menu components can never be open at the same time. For toasts that pile up and expand on hover, see [Stacked layers](#stacked-layers).
 
 | Layer option | Meaning |
 |---|---|
 | `limit` | Maximum number of active overlays. Closing overlays don't count. |
-| `overflow` | When the limit is reached: `"queue"` (default) waits for a free slot. `"dismiss-oldest"` dismisses the oldest overlay that isn't pending, and queues the new one if every active overlay is pending. |
-| `container` | A component that wraps the layer. It is always rendered, so it works as an `aria-live` region. Required for stack layers, where it also receives `group`. |
-| `stack` | `true` makes the layer a pile that expands on hover or focus. See below. |
+| `overflow` | What happens at the limit. `"queue"` (the default) waits for a free slot. `"dismiss-oldest"` dismisses the oldest overlay that isn't pending. If every active overlay is pending, it queues the new one. |
+| `container` | A component that wraps the layer. The manager always renders it, so it works as an `aria-live` region. It receives `children` and `overlays`, the layer's rendered overlays in the same form as [`useOverlays()`](#reading-open-overlays). |
 
 ## Defining an overlay
 
@@ -80,9 +82,13 @@ function UserInfoModal({ user }: UserModalProps) {
 }
 ```
 
-- `createOverlay<Props, Value = void>(layer, Component, options?)`. `Value` is what the overlay submits. `layer` must be a declared layer name, and `Component`'s props must match `Props`.
-- `useOverlay(Handle)` only works inside that handle's component. It throws a clear error anywhere else, including inside a different overlay. A component belongs to exactly one handle.
-- `exitTransition: true` keeps the overlay mounted in `closing` until it calls `exited()`. Without it, closing unmounts immediately.
+This example uses antd. The demo app builds the same overlays with shadcn/ui on Base UI.
+
+- `createOverlay<Props, Value = void>(layer, Component, options?)`. `Value` is the type the overlay submits. `layer` must be a declared layer name, and `Component`'s props must match `Props`.
+- `useOverlay(Handle)` works only inside that handle's component. Anywhere else, including inside a different overlay, it throws an error that names the overlay. A component belongs to exactly one handle.
+- `exitTransition: true` keeps the overlay mounted in `closing` until it calls `exited()`. Without it, the overlay unmounts as soon as it closes.
+- `exitTimeout` removes a closing overlay after this many milliseconds, even if it never calls `exited()`. It defaults to 1000. This covers a forgotten `exited()` call and animations that don't run, such as in a background tab. Pass `Infinity` to wait for `exited()` forever.
+- `displayName` sets the name used in those errors. It defaults to the component's `displayName` or `name`, which minifiers can rename in production builds.
 
 ## Opening
 
@@ -92,45 +98,50 @@ const instance = UserModal.open({ user }, {
   onDismiss: () => {},
 });
 
-instance.update({ user: other });  // replaces all props, no remount
+instance.update({ user: other });  // replaces all props without remounting
 instance.dismiss();
 
 overlays.dismissAll();             // or overlays.dismissAll("toast")
 ```
 
-`open` works anywhere: in components, event handlers, or an API interceptor outside React.
+You can call `open` anywhere, including in components, event handlers, and an API interceptor outside React.
 
 | Value | `useOverlay().submit` | `open()` callbacks |
 |---|---|---|
-| a type, e.g. `User` | `submit(user)` | `onSubmit` is **required**, so a submitted value can't be silently dropped |
-| `void` (default) | `submit()` | all optional. A void overlay without `onSubmit` just closes on submit. |
+| a type, such as `User` | `submit(user)` | `onSubmit` is **required**, so no caller can ignore a submitted value |
+| `void` (the default) | `submit()` | All optional. Without `onSubmit`, a void overlay closes when it submits. |
 
-Callbacks are read once, when `open` is called. For values that change while the overlay is open, read them from a ref or a store inside the callback.
+The manager reads the callbacks once, when you call `open`. If a callback needs a value that changes while the overlay is open, read it from a ref or a store.
 
 ### Awaiting the result
 
-`openAsync` returns a promise instead of an instance. It resolves once the overlay closes and never rejects:
+`openAsync` returns a promise instead of an instance. The promise resolves when the overlay closes and never rejects.
 
 ```tsx
 const result = await Confirm.openAsync({ text: "Delete?" });
 if (!result.submitted) return;
 
 const edited = await UserModal.openAsync({ user }, {
-  onSubmit: (user, { signal }) => api.saveUser(user, { signal }),  // optional; failures keep the overlay open
+  onSubmit: (user, { signal }) => api.saveUser(user, { signal }),  // optional; a failure keeps the overlay open
 });
-if (edited.submitted) setUser(edited.value);
+if (edited.submitted) {
+  edited.value;   // User: what the overlay submitted
+  edited.result;  // what saveUser returned, awaited
+}
 ```
 
 | Outcome | Resolves with |
 |---|---|
-| submit succeeds (`onSubmit` returned, or its promise resolved) | `{ submitted: true, value }` |
-| dismissed, evicted by `dismiss-oldest`, or an `abortable` submit aborted | `{ submitted: false }` |
+| The submit succeeds: `onSubmit` returned, or its promise resolved | `{ submitted: true, value, result }`. `value` is what the overlay submitted. `result` is the awaited return value of `onSubmit`, and `undefined` without `onSubmit`. |
+| The overlay was dismissed, evicted by `dismiss-oldest`, or an `abortable` submit was aborted | `{ submitted: false }` |
 
-`onSubmit` is optional here, even when the overlay submits a value, and `onDismiss` isn't accepted because the promise covers it. A failed `onSubmit` doesn't settle the promise: the overlay stays open in `failed` so the user can retry. The promise resolves once the overlay closes, so the caller can open the next one right away. With `exitTransition`, that's when the exit animation starts, not when it finishes. To update or dismiss the overlay from outside, use `open()`.
+With `openAsync`, `onSubmit` is optional even when the overlay submits a value. It doesn't accept `onDismiss`, because the promise reports dismissal. A failed `onSubmit` doesn't settle the promise. The overlay stays open in `failed` so the user can retry. The promise resolves as soon as the overlay closes, so the caller can open the next overlay right away. With `exitTransition`, that is when the exit animation starts, not when it ends. To update or dismiss the overlay from outside, use `open()`.
+
+> **New in 0.3.** The result has a `result` field with what `onSubmit` returned. `value` is still the submitted value.
 
 ### Aborting a pending submit
 
-By default an overlay can't be dismissed while `onSubmit` is pending. The caller can opt in:
+By default, the user can't dismiss an overlay while `onSubmit` is pending. The caller can allow it:
 
 ```tsx
 Confirm.open({ text: "Delete?" }, {
@@ -139,56 +150,22 @@ Confirm.open({ text: "Delete?" }, {
 });
 ```
 
-The pending state then has `abortable: true`, so the overlay can keep its Cancel button enabled. Dismissing aborts the signal, closes the overlay and calls `onDismiss`. The rejection from the aborted request is ignored.
+The pending state then has `abortable: true`, so the overlay can keep its Cancel button enabled. A dismiss aborts the signal, closes the overlay and calls `onDismiss`. The manager ignores the rejection from the aborted request.
 
-## Stacked layers
+## Reading open overlays
 
-`stack: true` turns a layer into an Ark UI–style pile:
-- Overlays overlap, with the newest in front.
-- Hovering or focusing the group spreads them into a list.
-- Auto-dismiss timers can pause while the pile is expanded.
-
-The library tracks positions and measures heights. Your components and CSS do the rendering.
+`overlays.useOverlays()` is a hook, and `overlays.getOverlays()` works anywhere. Both return a read-only view of each rendered overlay, with `{ id, layer, handle, props, state }`. The list leaves out queued overlays and includes closing ones, which have `phase: "closing"`.
 
 ```tsx
-function ToastGroup({ children, group }: StackContainerProps) {
-  // group = { expanded, count, frontHeight, props }
-  return (
-    <ol {...group.props} data-expanded={group.expanded} style={{ "--front-height": `${group.frontHeight}px` }}>
-      {children}
-    </ol>
-  );
-}
-
-function Toast({ message }: { message: string }) {
-  const { stack, dismiss } = useOverlay(ToastOverlay);
-  // stack = { index, count, expanded, paused, offset, ref }
-  useCountdown(4000, stack.paused, dismiss);
-  return (
-    <li data-expanded={stack.expanded} style={{ "--index": stack.index, "--offset": `${stack.offset}px` }}>
-      <div ref={stack.ref}>{message}</div>
-    </li>
-  );
+function useBlocker() {
+  // Block navigation while any overlay is waiting on async work.
+  return overlays.useOverlays().some((o) => o.state.phase === "pending");
 }
 ```
 
-| Field | Meaning |
-|---|---|
-| `index` | 0 is the newest overlay, at the front of the pile |
-| `count` | Number of active overlays in the layer. Queued and closing overlays don't count. |
-| `offset` | Sum of the measured heights of the newer overlays, in px. Add your gap in CSS: `calc(var(--offset) + var(--index) * var(--gap))`. |
-| `ref` | Attach to the element to measure. Heights come from layout (`offsetHeight` / `ResizeObserver`), so transforms like `scale` don't affect them. |
-| `expanded` | True while the group is hovered or focused. `group.props` sets it. Moving focus within the group keeps it expanded. |
-| `paused` | `expanded`, or the page is hidden. Pause timers on this. |
-| `group.frontHeight` | Height of the front overlay, for sizing the collapsed pile |
-
-A closing overlay keeps its last `index` and `offset` while it animates out. The others close the gap right away. `stack` exists only for overlays in a stack layer: `useOverlay(UserModal).stack` is a type error.
-
-See `demo/Toast.tsx`, `demo/ToastGroup.tsx` and `demo/styles.css` for a complete pile.
-
 ## State machine
 
-The state an overlay sees:
+This is the state an overlay reads from `useOverlay()`:
 
 ```ts
 type OverlayState =
@@ -198,70 +175,132 @@ type OverlayState =
   | { phase: "closing" };
 ```
 
-| from | event | to |
+| From | Event | To |
 |---|---|---|
-| — | `open()` | `idle`, or queued (not rendered) when the layer is full |
-| queued | a slot frees | `idle` |
-| queued | dismiss | removed, `onDismiss` |
-| idle / failed | `submit(v)` | calls `onSubmit(v, { signal })`: a promise → `pending`, a sync return → `closing`, a sync throw → `failed`. With no `onSubmit` → `closing`. |
-| pending | promise resolves | `closing` |
-| pending | promise rejects | `failed` (still mounted, so local state and form input are kept) |
+| start | `open()` | `idle`, or queued and not rendered when the layer is full |
+| queued | a slot frees up | `idle` |
+| queued | dismiss | removed, and `onDismiss` runs |
+| idle or failed | `submit(v)` | The manager calls `onSubmit(v, { signal })`. A returned promise moves the overlay to `pending`, a sync return moves it to `closing`, and a sync throw moves it to `failed`. Without `onSubmit`, it moves to `closing`. |
+| pending | the promise resolves | `closing` |
+| pending | the promise rejects | `failed`. The overlay stays mounted, so local state and form input survive. |
 | pending | submit | ignored |
-| pending | dismiss | ignored, unless `abortable`: abort → `closing`, `onDismiss` |
-| idle / failed | dismiss / dismissAll / evicted | `closing`, `onDismiss` |
-| closing | `exited()` (or immediately without `exitTransition`) | removed |
+| pending | dismiss | Ignored, unless `abortable`. Then the signal aborts, the overlay moves to `closing`, and `onDismiss` runs. |
+| idle or failed | dismiss, `dismissAll`, or eviction | `closing`, and `onDismiss` runs |
+| closing | `exited()`, `exitTimeout`, or right away without `exitTransition` | removed |
 
-Guarantees:
-- Every `open()` ends in exactly one of: `onSubmit` succeeded, or `onDismiss` was called.
-- Events not listed in the table are no-ops.
-- Only the next `submit` clears the error.
-- An overlay is never remounted while open.
-- Callbacks run after the state has been updated, so they can safely open other overlays.
+The manager guarantees the following.
+
+- Every `open()` ends in exactly one way. Either `onSubmit` succeeds or `onDismiss` runs.
+- Events missing from the table do nothing.
+- The error stays until the next `submit`.
+- The manager never remounts an open overlay.
+- Callbacks run after the state updates, so they can open other overlays.
+
+## Stacked layers
+
+The `react-overlord/stack` subpath turns a layer into a pile, like Ark UI's toasts. On JSR it is `@scgnkrgll/react-overlord/stack`.
+
+- Overlays overlap, with the newest in front.
+- Hovering or focusing the group spreads them into a list.
+- Auto-dismiss timers can pause while the pile is expanded.
+
+The hooks track positions and measure heights. Your components and CSS draw the pile. The layer itself is an ordinary layer whose container calls `useStack()`.
+
+```tsx
+// overlays.ts
+export const overlays = createOverlayManager({
+  layers: {
+    modal: {},
+    toast: { limit: 24, container: ToastGroup },  // a cap in case something opens toasts in a loop
+  },
+});
+```
+
+```tsx
+import type { LayerContainerProps } from "react-overlord";
+import { StackProvider, useStack, useStackItem } from "react-overlord/stack";
+
+function ToastGroup({ children, overlays }: LayerContainerProps) {
+  const stack = useStack(overlays);  // expanded, paused, count, frontHeight and props
+  return (
+    <ol {...stack.props} data-expanded={stack.expanded} style={{ "--front-height": `${stack.frontHeight}px` }}>
+      <StackProvider stack={stack}>{children}</StackProvider>
+    </ol>
+  );
+}
+
+function Toast({ message }: { message: string }) {
+  const { id, dismiss } = useOverlay(ToastOverlay);
+  const item = useStackItem(id);  // index, count, expanded, paused, offset and ref
+  useCountdown(4000, item.paused, dismiss);
+  return (
+    <li data-expanded={item.expanded} style={{ "--index": item.index, "--offset": `${item.offset}px` }}>
+      <div ref={item.ref}>{message}</div>
+    </li>
+  );
+}
+```
+
+| Field | Meaning |
+|---|---|
+| `index` | 0 is the newest overlay, at the front of the pile. |
+| `count` | Number of active overlays in the layer. Queued and closing overlays don't count. |
+| `offset` | Sum of the measured heights of the newer overlays, in px. Add your gap in CSS, for example `calc(var(--offset) + var(--index) * var(--gap))`. |
+| `ref` | Attach it to the element to measure. Heights come from `offsetHeight` and `ResizeObserver`, so transforms like `scale` don't change them. |
+| `expanded` | True while the group is hovered or focused. `stack.props` sets it. Moving focus between overlays in the group keeps it true. |
+| `paused` | True while `expanded` is true or the page is hidden. Pause timers on it. |
+| `stack.frontHeight` | Height of the front overlay. Use it to size the collapsed pile. |
+
+A closing overlay keeps its last `index` and `offset` while it animates out. The other overlays close the gap right away. `useStackItem()` throws if no `StackProvider` is around the overlay.
+
+To try it, click "Fire 5 toasts" in the [live demo](https://scgnkrgll.github.io/react-overlord/#demo) and hover the pile. Its source is in [`Toast.tsx`](https://github.com/scgnkrgll/react-overlord/blob/main/demo/Toast.tsx), [`ToastGroup.tsx`](https://github.com/scgnkrgll/react-overlord/blob/main/demo/ToastGroup.tsx), and [`styles.css`](https://github.com/scgnkrgll/react-overlord/blob/main/demo/styles.css), which has the CSS that draws the pile.
+
+## Testing
+
+The manager lives at module level, so overlays opened in one test are still open in the next. Call `reset()` between tests:
+
+```tsx
+afterEach(() => act(() => overlays.reset()));
+```
+
+`reset()` removes every overlay at once. It skips exit animations, calls no `onDismiss`, and aborts pending submits. Pending `openAsync()` promises resolve with `{ submitted: false }`. Render `<overlays.Outlet />` next to the component under test so opened overlays appear in the DOM.
 
 ## Comparison
 
-How react-overlord compares with [overlay-kit](https://github.com/toss/overlay-kit) (1.9) and [nice-modal-react](https://github.com/eBay/nice-modal-react) (1.2), based on their published type definitions.
+This table compares react-overlord with [overlay-kit](https://github.com/toss/overlay-kit) 1.9 and [nice-modal-react](https://github.com/eBay/nice-modal-react) 1.2, based on their published type definitions.
 
 | | react-overlord | overlay-kit | nice-modal-react |
 |---|---|---|---|
-| Result type | Declared once on the overlay | Annotated per call: `openAsync<T>()`, otherwise `unknown` | Annotated per call: `show<T>()`, otherwise `unknown` |
-| Submit vs. dismiss | Separate: `{ submitted: true, value }` or `{ submitted: false }` | One `close(value)`. Cancel is a value you pick, `reject` is untyped. | `resolve(unknown)` / `reject(unknown)`. Hiding without either leaves the promise pending. |
-| Props checked at open | Yes, required props are required | Yes, via JSX in the callback | Partially: `show()` accepts `Partial<Props>` |
-| Result can't be dropped | `onSubmit` is required when the overlay submits a value | No | No |
-| Async submit with pending and failed states | Built in, with retry and abort | Build it yourself | Build it yourself |
+| Result type | Declared once on the overlay | Annotated on each call with `openAsync<T>()`, otherwise `unknown` | Annotated on each call with `show<T>()`, otherwise `unknown` |
+| Awaited result | Typed per overlay: `{ submitted: true, value, result }`, with the submitted value and what `onSubmit` returned, or `{ submitted: false }` | One `close(value)`. You pick a value that means cancel, and `reject` is untyped. | `resolve(unknown)` or `reject(unknown)`. Hiding the modal without calling either leaves the promise pending. |
+| Props checked at open | Yes, required props are required | Yes, through JSX in the callback | Partly, because `show()` accepts `Partial<Props>` |
+| Callers must handle the result | `onSubmit` is required when the overlay submits a value | No | No |
+| Async submit with pending and failed states | Built in, with retry and abort | You build it | You build it |
 | Limits, queueing, render order | Per layer | No | No |
-| Stacked toasts | Built in | No | No |
-| Setup | Manager, layers, `createOverlay` per overlay | Provider, then inline `open()` | Provider, then `NiceModal.create()` |
+| Stacked toasts | Optional hooks in a subpath | No | No |
+| Setup | A manager, layers, and `createOverlay` for each overlay | A provider, then inline `open()` | A provider, then `NiceModal.create()` |
 
-The difference shows up as soon as you await a result:
+Awaiting a result shows the difference:
 
 ```tsx
-// overlay-kit: T can't be inferred from close(), so every caller has to annotate it
+// overlay-kit: close() can't infer T, so every caller has to annotate it
 const ok = await overlay.openAsync(({ isOpen, close }) => (
   <Confirm open={isOpen} onOk={() => close(true)} onCancel={() => close(false)} />
 ));
 // ok: unknown
 
-// react-overlord: the type comes from the overlay's definition
-const result = await UserModal.openAsync({ user });
-if (result.submitted) result.value; // User
+// react-overlord: the type comes from the overlay's definition and the submit handler
+const result = await UserModal.openAsync({ user }, {
+  onSubmit: (draft) => api.saveUser(draft),
+});
+if (result.submitted) {
+  result.value;   // User, what the overlay submitted
+  result.result;  // SavedUser, what saveUser returned
+}
 ```
 
-**When to pick something else.** For a few one-off confirm dialogs, overlay-kit is less setup: no manager and nothing to register. nice-modal-react ships ready-made helpers for antd, MUI and Bootstrap modals. react-overlord pays off when overlays are reused across an app, return data, or run async work that can fail.
+**When to pick something else.** For a few one-off confirm dialogs, overlay-kit needs less setup, because it has no manager and nothing to register. nice-modal-react has ready-made helpers for antd, MUI and Bootstrap modals.
 
-## Development
+## Contributing
 
-```sh
-pnpm test        # store, integration and type tests
-pnpm typecheck
-pnpm build       # esm + cjs + .d.ts
-pnpm demo        # Vite demo: forms, confirm, context menu, stacked toasts
-pnpm lint:pkg    # publint + are-the-types-wrong on the packed tarball
-```
-
-### Releasing
-
-```sh
-npm version patch        # bumps package.json and jsr.json, commits, tags vX.Y.Z
-git push --follow-tags   # the Release workflow publishes to npm and JSR
-```
+To run the tests and the demo locally, or to publish a release, see [CONTRIBUTING.md](https://github.com/scgnkrgll/react-overlord/blob/main/CONTRIBUTING.md).

@@ -1,12 +1,12 @@
 import { useContext } from "react";
 import { InstanceContext } from "./context.ts";
-import type { OverlayControlFor, OverlayHandle } from "./types.ts";
+import type { OverlayControl, OverlayHandle } from "./types.ts";
 
 /**
  * Controls for the overlay this component is rendered in. Must be called inside
  * the component registered for `handle`; open overlays with `handle.open()`.
  */
-export function useOverlay<P, V, S extends boolean>(handle: OverlayHandle<P, V, S>): OverlayControlFor<V, S> {
+export function useOverlay<P, V>(handle: OverlayHandle<P, V>): OverlayControl<V> {
   const context = useContext(InstanceContext);
   const name = handle.displayName;
   if (!context) {
@@ -21,5 +21,5 @@ export function useOverlay<P, V, S extends boolean>(handle: OverlayHandle<P, V, 
         : "Pass the handle of the overlay this component belongs to.";
     throw new Error(`useOverlay(${name}) was called inside a different overlay (${context.handle.displayName}). ${hint}`);
   }
-  return context.overlay as unknown as OverlayControlFor<V, S>;
+  return context.overlay as unknown as OverlayControl<V>;
 }

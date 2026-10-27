@@ -125,6 +125,26 @@ describe("submit", () => {
     expect(onDismiss).not.toHaveBeenCalled();
     expect(phase(id)).toBe("pending");
   });
+
+  test("onSubmitted receives the submitted value and what onSubmit returned", async () => {
+    const { store, open } = setup();
+    const onSubmitted = vi.fn();
+
+    const sync = open({ callbacks: { onSubmitted, onSubmit: () => "sync result" } });
+    store.submit(sync, "draft");
+    expect(onSubmitted).toHaveBeenCalledWith("draft", "sync result");
+
+    onSubmitted.mockClear();
+    const async = open({ callbacks: { onSubmitted, onSubmit: () => Promise.resolve("async result") } });
+    store.submit(async, "draft");
+    await flush();
+    expect(onSubmitted).toHaveBeenCalledWith("draft", "async result");
+
+    onSubmitted.mockClear();
+    const bare = open({ callbacks: { onSubmitted } });
+    store.submit(bare, "draft");
+    expect(onSubmitted).toHaveBeenCalledWith("draft", undefined);
+  });
 });
 
 describe("abortable", () => {
@@ -208,6 +228,40 @@ describe("exitTransition", () => {
     store.exited(id);
     expect(phase(id)).toBe("not rendered");
   });
+
+  test("removes a closing overlay after exitTimeout, 1000ms by default", () => {
+    vi.useFakeTimers();
+    try {
+      const { store, open, phase } = setup();
+      const byDefault = open({ exitTransition: true });
+      const custom = open({ exitTransition: true, exitTimeout: 200 });
+      const forever = open({ exitTransition: true, exitTimeout: Infinity });
+      store.dismissAll();
+      vi.advanceTimersByTime(200);
+      expect([phase(byDefault), phase(custom), phase(forever)]).toEqual(["closing", "not rendered", "closing"]);
+      vi.advanceTimersByTime(800);
+      expect([phase(byDefault), phase(forever)]).toEqual(["not rendered", "closing"]);
+      vi.advanceTimersByTime(60_000);
+      expect(phase(forever)).toBe("closing");
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  test("an exited() before the timeout cancels it", () => {
+    vi.useFakeTimers();
+    try {
+      const { store, open, visible } = setup({ modal: { limit: 1 } });
+      const first = open({ exitTransition: true });
+      store.dismiss(first);
+      store.exited(first);
+      const second = open({ exitTransition: true });
+      vi.advanceTimersByTime(5000);
+      expect(visible("modal")).toEqual([second]); // the stale timer did nothing
+    } finally {
+      vi.useRealTimers();
+    }
+  });
 });
 
 describe("layers", () => {
@@ -287,111 +341,51 @@ describe("snapshot", () => {
     store.update(a, { x: 1 });
     expect(entry(a)!.control).toBe(control);
   });
+
+  test("a layer's snapshot keeps its identity while only another layer changes", () => {
+    const { store, open } = setup({ modal: {}, toast: {} });
+    const toastLayer = () => store.getSnapshot().find((l) => l.layer === "toast")!;
+    const before = toastLayer();
+    open(); // a modal
+    expect(toastLayer()).toBe(before);
+    open({ layer: "toast" });
+    expect(toastLayer()).not.toBe(before);
+  });
 });
 
-describe("stack layers", () => {
-  const Container = () => null;
-  const stackSetup = () => setup({ toast: { stack: true, container: Container } });
-  const stackOf = (s: ReturnType<typeof stackSetup>, id: number) => s.entry(id)!.stack!;
-  const groupOf = (s: ReturnType<typeof stackSetup>) => s.store.getSnapshot()[0]!.group!;
-
-  test("newest is index 0 and offsets sum the heights of newer overlays", () => {
-    const s = stackSetup();
-    const [a, b, c] = [1, 2, 3].map(() => s.open({ layer: "toast" })) as [number, number, number];
-    s.store.setHeight(a, 10);
-    s.store.setHeight(b, 20);
-    s.store.setHeight(c, 30);
-    expect([a, b, c].map((id) => stackOf(s, id).index)).toEqual([2, 1, 0]);
-    expect([a, b, c].map((id) => stackOf(s, id).offset)).toEqual([50, 30, 0]);
-    expect(stackOf(s, a).count).toBe(3);
-    expect(groupOf(s)).toEqual({ expanded: false, count: 3, frontHeight: 30 });
+describe("layer config validation", () => {
+  test("the removed `stack: true` form throws with a migration hint", () => {
+    expect(() => setup({ toast: { stack: true } as unknown as LayerConfig })).toThrow(/useStack\(\)/);
   });
 
-  test("plain layers have no stack info", () => {
-    const { open, entry, store } = setup();
-    expect(entry(open())!.stack).toBeNull();
-    expect(store.getSnapshot()[0]!.group).toBeNull();
+  test("`stack: false` and `stack: undefined` are still accepted", () => {
+    expect(() => setup({ toast: { stack: false } as unknown as LayerConfig })).not.toThrow();
+    expect(() => setup({ toast: { stack: undefined } as unknown as LayerConfig })).not.toThrow();
   });
+});
 
-  test("a closing overlay keeps its position but no longer counts for the others", () => {
-    const s = stackSetup();
-    const a = s.open({ layer: "toast" });
-    const b = s.open({ layer: "toast", exitTransition: true });
-    s.store.setHeight(a, 10);
-    s.store.setHeight(b, 20);
-    expect(stackOf(s, a)).toMatchObject({ index: 1, offset: 20 });
+describe("reset", () => {
+  test("removes everything at once without callbacks, and aborts pending submits", () => {
+    const { store, open, visible } = setup({ modal: { limit: 1 } });
+    const onDismiss = vi.fn();
+    const onReset = vi.fn();
+    let signal!: AbortSignal;
+    const pending = open({
+      callbacks: { onDismiss, onReset, onSubmit: (_, ctx) => ((signal = ctx.signal), new Promise(() => {})) },
+    });
+    store.submit(pending, undefined);
+    open({ callbacks: { onDismiss } }); // queued behind the limit
+    const closing = open({ layer: "modal", exitTransition: true });
+    void closing;
 
-    s.store.dismiss(b);
-    expect(s.phase(b)).toBe("closing");
-    expect(stackOf(s, b)).toMatchObject({ index: 0, offset: 0, count: 1 });
-    expect(stackOf(s, a)).toMatchObject({ index: 0, offset: 0, count: 1 });
-  });
+    store.reset();
+    expect(store.getSnapshot().every((l) => l.entries.length === 0)).toBe(true);
+    expect(onDismiss).not.toHaveBeenCalled();
+    expect(onReset).toHaveBeenCalledTimes(1);
+    expect(signal.aborted).toBe(true);
 
-  test("expanded and paused", () => {
-    const s = stackSetup();
-    const a = s.open({ layer: "toast" });
-    s.store.setExpanded("toast", true);
-    expect(stackOf(s, a)).toMatchObject({ expanded: true, paused: true });
-    s.store.setExpanded("toast", false);
-    expect(stackOf(s, a)).toMatchObject({ expanded: false, paused: false });
-    s.store.setPageHidden(true);
-    expect(stackOf(s, a)).toMatchObject({ expanded: false, paused: true });
-  });
-
-  test("setExpanded is ignored for plain layers", () => {
-    const { store } = setup();
-    const listener = vi.fn();
-    store.subscribe(listener);
-    store.setExpanded("modal", true);
-    expect(listener).not.toHaveBeenCalled();
-  });
-
-  test("expanded resets when the layer becomes empty", () => {
-    const s = stackSetup();
-    const a = s.open({ layer: "toast" });
-    s.store.setExpanded("toast", true);
-    s.store.dismiss(a);
-    expect(groupOf(s).expanded).toBe(false);
-    const b = s.open({ layer: "toast" });
-    expect(stackOf(s, b).expanded).toBe(false);
-  });
-
-  test("a height change only replaces entries whose offset changed", () => {
-    const s = stackSetup();
-    const a = s.open({ layer: "toast" });
-    const b = s.open({ layer: "toast" });
-    const front = s.entry(b);
-    const listener = vi.fn();
-    s.store.subscribe(listener);
-
-    s.store.setHeight(a, 40); // a is behind b: nobody's offset depends on a's height
-    expect(listener).toHaveBeenCalledOnce();
-    expect(s.entry(b)).toBe(front);
-
-    s.store.setHeight(a, 40); // unchanged: no notification
-    expect(listener).toHaveBeenCalledOnce();
-
-    const control = s.entry(a)!.control;
-    s.store.setHeight(b, 25);
-    expect(s.entry(a)!.stack!.offset).toBe(25);
-    expect(s.entry(a)!.control).toBe(control); // position-only change keeps the control stable
-  });
-
-  test("setHeights applies several measurements with one notification", () => {
-    const s = stackSetup();
-    const a = s.open({ layer: "toast" });
-    const b = s.open({ layer: "toast" });
-    const listener = vi.fn();
-    s.store.subscribe(listener);
-
-    s.store.setHeights([
-      [a, 30],
-      [b, 20],
-    ]);
-    expect(listener).toHaveBeenCalledOnce();
-    expect(s.entry(a)!.stack!.offset).toBe(20);
-
-    s.store.setHeights([[a, 30]]); // unchanged: no notification
-    expect(listener).toHaveBeenCalledOnce();
+    // The store still works after a reset.
+    const next = open();
+    expect(visible("modal")).toEqual([next]);
   });
 });

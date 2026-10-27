@@ -1,6 +1,6 @@
 {
   "name": "react-overlord",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "Type-safe, headless manager for modals, menus, toasts and other overlays.",
   "license": "MIT",
   "author": "Seçgin Karagülle",
@@ -39,6 +39,16 @@
         "default": "./dist/index.cjs"
       }
     },
+    "./stack": {
+      "import": {
+        "types": "./dist/stack.d.ts",
+        "default": "./dist/stack.js"
+      },
+      "require": {
+        "types": "./dist/stack.d.cts",
+        "default": "./dist/stack.cjs"
+      }
+    },
     "./package.json": "./package.json"
   },
   "files": [
@@ -57,7 +67,7 @@
     "typecheck": "tsc --noEmit && tsc --noEmit -p demo",
     "demo": "vite demo",
     "demo:build": "vite build demo",
-    "lint:pkg": "publint && attw --pack .",
+    "lint:pkg": "publint && attw --pack . --profile node16",
     "version": "node scripts/sync-jsr-version.mjs && git add jsr.json",
     "prepublishOnly": "pnpm typecheck && pnpm test && pnpm build && pnpm lint:pkg"
   },

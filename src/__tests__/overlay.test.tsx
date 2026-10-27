@@ -2,7 +2,7 @@ import { act, render, screen } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { useState } from "react";
 import { afterEach, describe, expect, test, vi } from "vitest";
-import { createOverlayManager, useOverlay, type StackContainerProps } from "../index.ts";
+import { createOverlayManager, useOverlay } from "../index.ts";
 
 function setup() {
   const overlays = createOverlayManager({ layers: { modal: {}, toast: { limit: 1 } } });
@@ -103,13 +103,13 @@ describe("form overlay", () => {
 });
 
 describe("openAsync", () => {
-  test("resolves with the value after onSubmit succeeds, keeping the overlay open through a failure", async () => {
+  test("resolves with the value and what onSubmit returned, keeping the overlay open through a failure", async () => {
     const user = userEvent.setup();
     const { NameOverlay } = setup();
     const onSubmit = vi
-      .fn<(name: string) => Promise<void>>()
+      .fn<(name: string) => Promise<string>>()
       .mockRejectedValueOnce(new Error("Server down"))
-      .mockResolvedValueOnce(undefined);
+      .mockResolvedValueOnce("saved:Ada");
     let result!: Promise<unknown>;
     act(() => void (result = NameOverlay.openAsync({ title: "Rename" }, { onSubmit })));
     const settled = vi.fn();
@@ -121,11 +121,11 @@ describe("openAsync", () => {
     expect(settled).not.toHaveBeenCalled();
 
     await user.click(screen.getByText("Save"));
-    await expect(result).resolves.toEqual({ submitted: true, value: "Ada" });
+    await expect(result).resolves.toEqual({ submitted: true, value: "Ada", result: "saved:Ada" });
     expect(screen.queryByRole("dialog")).toBeNull();
   });
 
-  test("resolves without onSubmit as soon as the overlay submits", async () => {
+  test("result is undefined when there is no onSubmit", async () => {
     const user = userEvent.setup();
     const { NameOverlay } = setup();
     let result!: Promise<unknown>;
@@ -133,7 +133,7 @@ describe("openAsync", () => {
 
     await user.type(screen.getByLabelText("name"), "Ada");
     await user.click(screen.getByText("Save"));
-    await expect(result).resolves.toEqual({ submitted: true, value: "Ada" });
+    await expect(result).resolves.toEqual({ submitted: true, value: "Ada", result: undefined });
   });
 
   test("resolves with submitted: false on dismiss, including an aborted submit", async () => {
@@ -235,112 +235,55 @@ describe("useOverlay guard", () => {
     render(<overlays.Outlet />);
     expect(() => act(() => void WrongHandle.open())).toThrow(/called inside a different overlay \(Wrong\)/);
   });
+
+  test("the displayName option names the overlay in errors", () => {
+    const overlays = createOverlayManager({ layers: { modal: {} } });
+    const Handle = overlays.createOverlay("modal", () => null, { displayName: "ConfirmDialog" });
+    function Outside() {
+      useOverlay(Handle);
+      return null;
+    }
+    vi.spyOn(console, "error").mockImplementation(() => {});
+    expect(() => render(<Outside />)).toThrow(
+      "useOverlay(ConfirmDialog) must be called inside the ConfirmDialog overlay component",
+    );
+  });
 });
 
-describe("stack layers", () => {
-  function setupStack() {
-    // jsdom has no layout: report heights from a data attribute, and let tests trigger resizes.
-    vi.spyOn(HTMLElement.prototype, "offsetHeight", "get").mockImplementation(function (this: HTMLElement) {
-      return Number(this.dataset.height ?? 0);
-    });
-    const observed = new Set<Element>();
-    let notify!: (entries: ResizeObserverEntry[]) => void;
-    vi.stubGlobal(
-      "ResizeObserver",
-      class {
-        constructor(callback: (entries: ResizeObserverEntry[]) => void) {
-          notify = callback;
-        }
-        observe(el: Element) {
-          observed.add(el);
-        }
-        unobserve(el: Element) {
-          observed.delete(el);
-        }
-        disconnect() {}
-      },
-    );
-    const resize = (el: HTMLElement, height: number) =>
-      act(() => notify([{ target: el, borderBoxSize: [{ blockSize: height, inlineSize: 0 }] } as never]));
-
-    function Group({ children, group }: StackContainerProps) {
-      return (
-        <ol aria-label="toasts" data-expanded={group.expanded} data-count={group.count} data-front={group.frontHeight} {...group.props}>
-          {children}
-        </ol>
-      );
-    }
-    const overlays = createOverlayManager({ layers: { toast: { stack: true, container: Group } } });
-    function Toast({ text, height }: { text: string; height: number }) {
-      const { stack } = useOverlay(ToastOverlay);
-      return (
-        <li
-          ref={stack.ref}
-          data-height={height}
-          data-index={stack.index}
-          data-offset={stack.offset}
-          data-paused={stack.paused}
-          aria-label={text}
-        />
-      );
-    }
-    const ToastOverlay = overlays.createOverlay("toast", Toast);
-    render(<overlays.Outlet />);
-    return { ToastOverlay, observed, resize };
-  }
-
-  afterEach(() => {
-    vi.unstubAllGlobals();
-    vi.restoreAllMocks();
-  });
-
-  test("toasts get their index and measured offsets, the container gets the group", () => {
-    const { ToastOverlay, observed } = setupStack();
-    act(() => {
-      ToastOverlay.open({ text: "first", height: 40 });
-      ToastOverlay.open({ text: "second", height: 60 });
-    });
-    const first = screen.getByLabelText("first");
-    const second = screen.getByLabelText("second");
-    expect(second).toHaveAttribute("data-index", "0");
-    expect(first).toHaveAttribute("data-index", "1");
-    expect(first).toHaveAttribute("data-offset", "60");
-    expect(screen.getByLabelText("toasts")).toHaveAttribute("data-count", "2");
-    expect(screen.getByLabelText("toasts")).toHaveAttribute("data-front", "60");
-    expect(observed).toEqual(new Set([first, second]));
-  });
-
-  test("a resize updates the offsets behind it", () => {
-    const { ToastOverlay, resize } = setupStack();
-    act(() => {
-      ToastOverlay.open({ text: "first", height: 40 });
-      ToastOverlay.open({ text: "second", height: 60 });
-    });
-    resize(screen.getByLabelText("second"), 90);
-    expect(screen.getByLabelText("first")).toHaveAttribute("data-offset", "90");
-  });
-
-  test("hovering the group expands and pauses the toasts", async () => {
+describe("observing overlays", () => {
+  test("getOverlays and useOverlays reflect open overlays and their phases", async () => {
     const user = userEvent.setup();
-    const { ToastOverlay } = setupStack();
-    act(() => void ToastOverlay.open({ text: "only", height: 40 }));
-    const group = screen.getByLabelText("toasts");
+    const { overlays, NameOverlay } = setup();
+    const seen: string[][] = [];
+    function Watcher() {
+      seen.push(overlays.useOverlays().map((v) => `${v.layer}:${v.state.phase}`));
+      return null;
+    }
+    render(<Watcher />);
+    expect(overlays.getOverlays()).toEqual([]);
 
-    await user.hover(group);
-    expect(group).toHaveAttribute("data-expanded", "true");
-    expect(screen.getByLabelText("only")).toHaveAttribute("data-paused", "true");
+    act(() => void NameOverlay.open({ title: "Rename" }, { onSubmit: () => Promise.resolve("ok") }));
+    expect(seen.at(-1)).toEqual(["modal:idle"]);
+    expect(overlays.getOverlays()[0]).toMatchObject({
+      layer: "modal",
+      handle: NameOverlay,
+      props: { title: "Rename" },
+    });
 
-    await user.unhover(group);
-    expect(group).toHaveAttribute("data-expanded", "false");
-    expect(screen.getByLabelText("only")).toHaveAttribute("data-paused", "false");
+    await user.click(screen.getByText("Save"));
+    await vi.waitFor(() => expect(seen.at(-1)).toEqual([]));
+    expect(overlays.getOverlays()).toEqual([]);
   });
+});
 
-  test("removing a toast unobserves it", () => {
-    const { ToastOverlay, observed } = setupStack();
-    let instance!: ReturnType<typeof ToastOverlay.open>;
-    act(() => void (instance = ToastOverlay.open({ text: "gone", height: 40 })));
-    expect(observed.size).toBe(1);
-    act(() => instance.dismiss());
-    expect(observed.size).toBe(0);
+describe("reset", () => {
+  test("clears the screen and settles openAsync with submitted: false", async () => {
+    const { NameOverlay, overlays } = setup();
+    let result!: Promise<unknown>;
+    act(() => void (result = NameOverlay.openAsync({ title: "Rename" })));
+    expect(screen.getByRole("dialog")).toBeInTheDocument();
+    act(() => overlays.reset());
+    expect(screen.queryByRole("dialog")).toBeNull();
+    await expect(result).resolves.toEqual({ submitted: false });
   });
 });

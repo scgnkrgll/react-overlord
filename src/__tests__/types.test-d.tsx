@@ -2,14 +2,15 @@ import { describe, expectTypeOf, test } from "vitest";
 import {
   createOverlayManager,
   useOverlay,
+  type LayerContainerProps,
   type OverlayControl,
   type OverlayHandle,
   type OverlayInstance,
   type OverlayResult,
   type OverlayState,
-  type StackContainerProps,
-  type StackInfo,
+  type OverlayView,
 } from "../index.ts";
+import { StackProvider, useStack, useStackItem, type StackItem } from "../stack.ts";
 
 interface User {
   id: string;
@@ -96,11 +97,11 @@ describe("open", () => {
 describe("openAsync", () => {
   test("resolves to a result narrowed by submitted", async () => {
     const result = await UserModal.openAsync({});
-    expectTypeOf(result).toEqualTypeOf<OverlayResult<User>>();
+    expectTypeOf(result).toEqualTypeOf<OverlayResult<User, undefined>>();
     if (result.submitted) expectTypeOf(result.value).toEqualTypeOf<User>();
     // @ts-expect-error value only exists once narrowed to submitted
     void result.value;
-    expectTypeOf(Confirm.openAsync({ text: "Delete?" })).toEqualTypeOf<Promise<OverlayResult<void>>>();
+    expectTypeOf(Confirm.openAsync({ text: "Delete?" })).toEqualTypeOf<Promise<OverlayResult<void, undefined>>>();
   });
 
   test("onSubmit is optional even for non-void values, and onDismiss isn't accepted", () => {
@@ -114,6 +115,23 @@ describe("openAsync", () => {
     Notice.openAsync();
     // @ts-expect-error text is required
     Confirm.openAsync();
+  });
+
+  test("value is the submitted value; result is what onSubmit returned, awaited", async () => {
+    const async = await UserModal.openAsync({}, { onSubmit: (user) => Promise.resolve(user.id) });
+    if (async.submitted) {
+      expectTypeOf(async.value).toEqualTypeOf<User>();
+      expectTypeOf(async.result).toEqualTypeOf<string>();
+    }
+
+    const sync = await UserModal.openAsync({}, { onSubmit: (user) => user.name.length });
+    if (sync.submitted) expectTypeOf(sync.result).toEqualTypeOf<number>();
+
+    const bare = await UserModal.openAsync({});
+    if (bare.submitted) {
+      expectTypeOf(bare.value).toEqualTypeOf<User>();
+      expectTypeOf(bare.result).toEqualTypeOf<undefined>();
+    }
   });
 });
 
@@ -133,47 +151,41 @@ describe("useOverlay", () => {
   });
 });
 
-describe("stack layers", () => {
-  function Group({ children, group }: StackContainerProps) {
-    return <ol {...group.props}>{children}</ol>;
+describe("stacks", () => {
+  function Group({ children, overlays: views }: LayerContainerProps) {
+    expectTypeOf(views).toEqualTypeOf<ReadonlyArray<OverlayView>>();
+    const stack = useStack(views);
+    return (
+      <ol {...stack.props}>
+        <StackProvider stack={stack}>{children}</StackProvider>
+      </ol>
+    );
   }
-  const stacked = createOverlayManager({
-    layers: { modal: {}, toast: { stack: true, container: Group } },
-  });
+  const stacked = createOverlayManager({ layers: { modal: {}, toast: { container: Group } } });
 
   function StackToast({ text }: { text: string }) {
-    const { stack } = useOverlay(StackToastOverlay);
-    expectTypeOf(stack).toEqualTypeOf<StackInfo>();
-    return <li ref={stack.ref}>{text}</li>;
+    const { id } = useOverlay(StackToastOverlay);
+    const item = useStackItem(id);
+    expectTypeOf(item).toEqualTypeOf<StackItem>();
+    return <li ref={item.ref}>{text}</li>;
   }
-  // Explicit <Props, Value> generics still pick the right overload from the layer name.
   const StackToastOverlay = stacked.createOverlay<{ text: string }, string>("toast", StackToast);
 
-  function PlainModal() {
-    const overlay = useOverlay(PlainModalOverlay);
-    // @ts-expect-error only overlays in a stack layer have `stack`
-    void overlay.stack;
-    return null;
-  }
-  const PlainModalOverlay = stacked.createOverlay("modal", PlainModal);
-
-  test("the handle carries the stack flag", () => {
-    expectTypeOf(StackToastOverlay).toEqualTypeOf<OverlayHandle<{ text: string }, string, true>>();
-    expectTypeOf<NonNullable<(typeof PlainModalOverlay)["~types"]>["stack"]>().toEqualTypeOf<false>();
+  test("handles in any layer have the same shape", () => {
+    expectTypeOf(StackToastOverlay).toEqualTypeOf<OverlayHandle<{ text: string }, string>>();
   });
 
-  test("a stack layer requires a stack container", () => {
-    // @ts-expect-error container is required for stack layers
-    createOverlayManager({ layers: { toast: { stack: true } } });
+  test("containers that ignore overlays still fit", () => {
     const Plain = ({ children }: { children?: React.ReactNode }) => <div>{children}</div>;
-    // @ts-expect-error a stack container must accept `group`
-    createOverlayManager({ layers: { toast: { stack: true, container: (_: { other: number }) => null } } });
     createOverlayManager({ layers: { modal: { container: Plain } } });
+    // @ts-expect-error a container can't require other props
+    createOverlayManager({ layers: { modal: { container: (_: { other: number }) => null } } });
   });
+});
 
-  test("stack layer names are still checked", () => {
-    // @ts-expect-error not a declared layer
-    stacked.createOverlay("drawer", StackToast);
-    stacked.dismissAll("toast");
+describe("observing overlays", () => {
+  test("views are typed by layer name", () => {
+    expectTypeOf(overlays.useOverlays()).toEqualTypeOf<ReadonlyArray<OverlayView<"modal" | "menu" | "toast">>>();
+    expectTypeOf(overlays.getOverlays()).toEqualTypeOf<ReadonlyArray<OverlayView<"modal" | "menu" | "toast">>>();
   });
 });

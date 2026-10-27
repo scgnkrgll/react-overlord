@@ -7,8 +7,10 @@ export interface Callbacks {
   onSubmit?: ((value: never, context: { signal: AbortSignal }) => unknown) | undefined;
   onDismiss?: (() => void) | undefined;
   abortable?: boolean | undefined;
-  /** Internal: called after a successful submit closes the overlay. Backs `openAsync`. */
-  onSubmitted?: ((value: unknown) => void) | undefined;
+  /** Internal: called with the submitted value and onSubmit's result after a successful submit. Backs `openAsync`. */
+  onSubmitted?: ((value: unknown, result: unknown) => void) | undefined;
+  /** Internal: called by `reset()`, which skips `onDismiss`. Lets `openAsync` settle its promise. */
+  onReset?: (() => void) | undefined;
 }
 
 export interface OpenRequest<H, C> {
@@ -16,30 +18,18 @@ export interface OpenRequest<H, C> {
   handle: H;
   component: C;
   exitTransition: boolean;
+  /** With exitTransition: ms after closing starts before the overlay is removed anyway. */
+  exitTimeout?: number | undefined;
   props: unknown;
   callbacks: Callbacks;
 }
 
 export interface Control {
+  readonly id: number;
   readonly state: OverlayState;
   readonly submit: (value?: unknown) => void;
   readonly dismiss: () => void;
   readonly exited: () => void;
-}
-
-/** Position of an overlay in a stack layer. */
-export interface StackData {
-  readonly index: number;
-  readonly count: number;
-  readonly expanded: boolean;
-  readonly paused: boolean;
-  readonly offset: number;
-}
-
-export interface GroupData {
-  readonly expanded: boolean;
-  readonly count: number;
-  readonly frontHeight: number;
 }
 
 /** Immutable view of a rendered overlay. Replaced only when that overlay changes. */
@@ -49,49 +39,42 @@ export interface Entry<H, C> {
   readonly component: C;
   readonly props: unknown;
   readonly control: Control;
-  /** Null outside stack layers. */
-  readonly stack: StackData | null;
 }
 
-export type Snapshot<H, C> = ReadonlyArray<{
+/** One layer of a snapshot. Keeps its identity while none of its entries change. */
+export interface LayerSnapshot<H, C> {
   readonly layer: string;
   readonly entries: ReadonlyArray<Entry<H, C>>;
-  /** Null outside stack layers. */
-  readonly group: GroupData | null;
-}>;
+}
+
+export type Snapshot<H, C> = ReadonlyArray<LayerSnapshot<H, C>>;
 
 interface OverlayRecord<H, C> {
   readonly id: number;
   readonly request: OpenRequest<H, C>;
   props: unknown;
   state: RecordState;
-  /** Incremented per submit, so a late settle of an older attempt is ignored. */
-  attempt: number;
+  /** The in-flight submit attempt, if any. Identity doubles as the stale-attempt check. */
   controller: AbortController | null;
   fns: Omit<Control, "state">;
   control: Control | null;
   entry: Entry<H, C> | null;
-  /** Measured height, for stack offsets. */
-  height: number;
-  /** Last computed stack position. A closing overlay keeps its index and offset while it animates out. */
-  stack: StackData | null;
+  /** Removes a closing overlay that never called exited(). */
+  exitTimer?: ReturnType<typeof setTimeout>;
 }
 
+/** Whether an overlay counts toward its layer's limit (not queued, not closing). */
 const isActive = (state: RecordState) =>
   state.phase === "idle" || state.phase === "pending" || state.phase === "failed";
 
-const sameStack = (a: StackData | null, b: StackData | null) =>
-  a === b ||
-  (a !== null &&
-    b !== null &&
-    a.index === b.index &&
-    a.count === b.count &&
-    a.expanded === b.expanded &&
-    a.paused === b.paused &&
-    a.offset === b.offset);
+const DEFAULT_EXIT_TIMEOUT = 1000;
 
-const isThenable = (value: unknown): value is PromiseLike<unknown> =>
-  typeof value === "object" && value !== null && typeof (value as PromiseLike<unknown>).then === "function";
+/** Surface a caller callback error without breaking the store or skipping other callbacks. */
+const reportAsync = (error: unknown) => {
+  queueMicrotask(() => {
+    throw error;
+  });
+};
 
 /**
  * Framework-agnostic overlay state. Every transition goes through a method below
@@ -107,14 +90,18 @@ export class OverlayStore<H, C> {
   private effects: Array<() => void> = [];
   private batchDepth = 0;
   private changed = false;
-  private readonly expanded = new Map<string, boolean>();
-  private pageHidden = false;
 
   constructor(layers: Record<string, LayerConfig>) {
     for (const [name, config] of Object.entries(layers)) {
       const { limit } = config;
       if (limit !== undefined && (!Number.isInteger(limit) || limit < 1)) {
         throw new Error(`Layer "${name}": limit must be a positive integer, got ${limit}.`);
+      }
+      // Only the removed `stack: true` form; `stack: false` / `undefined` were always no-ops.
+      if ((config as { stack?: unknown }).stack === true) {
+        throw new Error(
+          `Layer "${name}": "stack: true" was removed in 0.3. Give the layer a container that calls useStack() from "react-overlord/stack".`,
+        );
       }
     }
     this.layers = new Map(Object.entries(layers));
@@ -144,17 +131,15 @@ export class OverlayStore<H, C> {
         request,
         props: request.props,
         state: { phase: "queued" },
-        attempt: 0,
         controller: null,
         fns: {
+          id,
           submit: (value) => this.submit(id, value),
           dismiss: () => this.dismiss(id),
           exited: () => this.exited(id),
         },
         control: null,
         entry: null,
-        height: 0,
-        stack: null,
       };
       this.records.set(id, record);
 
@@ -184,43 +169,63 @@ export class OverlayStore<H, C> {
 
     this.batch(() => {
       const { onSubmit, onSubmitted, abortable = false } = record.request.callbacks;
-      const succeed = () => {
-        if (onSubmitted) this.effects.push(() => onSubmitted(value));
+      // `openAsync` resolves with the result: onSubmit's return value, or the submitted value without one.
+      const succeed = (result: unknown) => {
+        if (onSubmitted) this.effects.push(() => onSubmitted(value, result));
         this.close(record);
       };
       if (!onSubmit) {
-        succeed();
+        succeed(undefined);
         return;
       }
 
-      const attempt = ++record.attempt;
+      // Mark the attempt in flight before invoking caller code: a reentrant submit is ignored,
+      // and a dismiss-oldest open can't evict this overlay while its handler runs. Inside this
+      // batch, so a synchronous handler still closes without anyone seeing a pending flash.
       const controller = new AbortController();
       record.controller = controller;
-      const context = { signal: controller.signal };
+      this.setState(record, { phase: "pending", abortable });
+      const isCurrent = () => this.records.get(id) === record && record.controller === controller;
+      const fail = (error: unknown) => {
+        if (!isCurrent()) return;
+        record.controller = null;
+        this.setState(record, { phase: "failed", error });
+      };
 
       let result: unknown;
       try {
-        result = (onSubmit as (value: unknown, context: { signal: AbortSignal }) => unknown)(value, context);
+        result = (onSubmit as (value: unknown, context: { signal: AbortSignal }) => unknown)(value, {
+          signal: controller.signal,
+        });
       } catch (error) {
-        this.setState(record, { phase: "failed", error });
+        fail(error);
         return;
       }
 
-      if (!isThenable(result)) {
-        succeed();
+      // The handler may have dismissed its own overlay (when abortable). Returned thenables are
+      // still consumed below so their rejections are handled, but only a current attempt changes state.
+      let then: unknown;
+      try {
+        then =
+          (typeof result === "object" && result !== null) || typeof result === "function"
+            ? (result as PromiseLike<unknown>).then
+            : undefined;
+      } catch (error) {
+        // A throwing `then` getter is a rejection.
+        fail(error);
         return;
       }
-
-      this.setState(record, { phase: "pending", abortable });
-      const isCurrent = () =>
-        this.records.get(id) === record && record.attempt === attempt && record.state.phase === "pending";
-      result.then(
-        () => {
-          if (isCurrent()) this.batch(succeed);
+      if (typeof then !== "function") {
+        if (isCurrent()) succeed(result);
+        return;
+      }
+      // Assimilate through a native promise: a throwing then() call, multiple settlements and
+      // nested thenables all behave like a real promise, and stale rejections stay handled.
+      Promise.resolve(result).then(
+        (resolved) => {
+          if (isCurrent()) this.batch(() => succeed(resolved));
         },
-        (error: unknown) => {
-          if (isCurrent()) this.batch(() => this.setState(record, { phase: "failed", error }));
-        },
+        (error: unknown) => this.batch(() => fail(error)),
       );
     });
   }
@@ -232,12 +237,18 @@ export class OverlayStore<H, C> {
     if (state.phase === "closing" || (state.phase === "pending" && !state.abortable)) return;
 
     this.batch(() => {
+      // Re-check inside the batch: an abort listener may have reentered dismissal.
+      if (this.records.get(id) !== record) return;
+      const current = record.state;
+      if (current.phase === "closing" || (current.phase === "pending" && !current.abortable)) return;
+      const controller = record.controller;
       const { onDismiss } = record.request.callbacks;
       if (onDismiss) this.effects.push(onDismiss);
-      if (state.phase === "pending") record.controller?.abort();
-
-      if (state.phase === "queued") this.remove(record);
+      if (current.phase === "queued") this.remove(record);
       else this.close(record);
+      // Abort last: abort listeners dispatch synchronously and may reenter, so they must
+      // already see terminal state. The signal is aborted before dismiss() returns.
+      controller?.abort();
     });
   }
 
@@ -257,34 +268,18 @@ export class OverlayStore<H, C> {
     });
   }
 
-  setHeight(id: number, height: number): void {
-    this.setHeights([[id, height]]);
-  }
-
-  /** Applies several measurements (e.g. one ResizeObserver callback) with a single notification. */
-  setHeights(heights: Iterable<readonly [id: number, height: number]>): void {
+  reset(): void {
     this.batch(() => {
-      for (const [id, height] of heights) {
-        const record = this.records.get(id);
-        if (!record || record.height === height) continue;
-        record.height = height;
-        this.changed = true;
+      for (const record of this.records.values()) {
+        if (record.exitTimer !== undefined) clearTimeout(record.exitTimer);
+        const controller = record.controller;
+        record.controller = null;
+        const { onReset } = record.request.callbacks;
+        if (onReset) this.effects.push(onReset);
+        // After the record is gone, so a rejection from the aborted submit changes nothing.
+        if (controller) this.effects.push(() => controller.abort());
       }
-    });
-  }
-
-  setExpanded(layer: string, expanded: boolean): void {
-    if (!this.layers.get(layer)?.stack || (this.expanded.get(layer) ?? false) === expanded) return;
-    this.batch(() => {
-      this.expanded.set(layer, expanded);
-      this.changed = true;
-    });
-  }
-
-  setPageHidden(hidden: boolean): void {
-    if (this.pageHidden === hidden) return;
-    this.batch(() => {
-      this.pageHidden = hidden;
+      this.records.clear();
       this.changed = true;
     });
   }
@@ -293,6 +288,7 @@ export class OverlayStore<H, C> {
     record.controller = null;
     if (record.request.exitTransition) {
       this.setState(record, { phase: "closing" });
+      this.scheduleExitTimeout(record);
       // Closing overlays don't count toward the limit, so a queued one can enter while this one animates out.
       this.promote(record.request.layer);
     } else {
@@ -300,13 +296,19 @@ export class OverlayStore<H, C> {
     }
   }
 
+  private scheduleExitTimeout(record: OverlayRecord<H, C>): void {
+    const ms = record.request.exitTimeout ?? DEFAULT_EXIT_TIMEOUT;
+    if (!Number.isFinite(ms)) return;
+    record.exitTimer = setTimeout(() => this.exited(record.id), Math.max(0, ms));
+    // Don't keep a Node process alive just for this timer.
+    (record.exitTimer as unknown as { unref?: () => void }).unref?.();
+  }
+
   private remove(record: OverlayRecord<H, C>): void {
-    const { layer } = record.request;
+    if (record.exitTimer !== undefined) clearTimeout(record.exitTimer);
     this.records.delete(record.id);
     this.changed = true;
-    this.promote(layer);
-    // The pointer-leave that would collapse an emptied group never fires once its content unmounts.
-    if (![...this.records.values()].some((r) => r.request.layer === layer)) this.expanded.delete(layer);
+    this.promote(record.request.layer);
   }
 
   private promote(layer: string): void {
@@ -338,21 +340,26 @@ export class OverlayStore<H, C> {
   /** Groups nested transitions so listeners are notified once, then runs queued callbacks. */
   private batch<T>(fn: () => T): T {
     this.batchDepth++;
-    let result: T;
     try {
-      result = fn();
+      return fn();
     } finally {
       this.batchDepth--;
+      // Flush even when fn threw: pending changes and callbacks must not leak into a later batch.
+      if (this.batchDepth === 0) this.flush();
     }
-    if (this.batchDepth === 0) this.flush();
-    return result;
   }
 
   private flush(): void {
     if (this.changed) {
       this.changed = false;
       this.snapshot = this.buildSnapshot();
-      for (const listener of this.listeners) listener();
+      for (const listener of this.listeners) {
+        try {
+          listener();
+        } catch (error) {
+          reportAsync(error);
+        }
+      }
     }
     const effects = this.effects;
     this.effects = [];
@@ -360,48 +367,33 @@ export class OverlayStore<H, C> {
       try {
         effect();
       } catch (error) {
-        // A throwing caller callback must not break the store or skip other callbacks.
-        queueMicrotask(() => {
-          throw error;
-        });
+        reportAsync(error);
       }
     }
   }
 
   private buildSnapshot(): Snapshot<H, C> {
-    return [...this.layers.entries()].map(([layer, config]) => {
-      const records = [...this.records.values()].filter(
-        (r) => r.request.layer === layer && r.state.phase !== "queued",
-      );
-      if (!config.stack) return { layer, entries: records.map((r) => this.entryOf(r, null)), group: null };
-
-      const expanded = this.expanded.get(layer) ?? false;
-      const paused = expanded || this.pageHidden;
-      // Newest first: index 0 is the front of the pile.
-      const active = records.filter((r) => isActive(r.state)).reverse();
-      const count = active.length;
-      let offset = 0;
-      active.forEach((record, index) => {
-        record.stack = { index, count, expanded, paused, offset };
-        offset += record.height;
-      });
-      const entries = records.map((record) => {
-        const last = record.stack ?? { index: 0, offset: 0 };
-        // Closing overlays keep their last index and offset so they animate out in place.
-        const stack = isActive(record.state)
-          ? record.stack
-          : { index: last.index, offset: last.offset, count, expanded, paused };
-        return this.entryOf(record, stack);
-      });
-      return { layer, entries, group: { expanded, count, frontHeight: active[0]?.height ?? 0 } };
+    const previous = this.snapshot as Snapshot<H, C> | undefined;
+    return [...this.layers.keys()].map((layer, index) => {
+      const entries: Entry<H, C>[] = [];
+      for (const record of this.records.values()) {
+        if (record.request.layer === layer && record.state.phase !== "queued") entries.push(this.entryOf(record));
+      }
+      // Reuse the layer object while its entries are the same, so the layer's container and
+      // `useStack()` don't recompute when only another layer changed.
+      const old = previous?.[index];
+      if (old && old.entries.length === entries.length && old.entries.every((entry, i) => entry === entries[i])) {
+        return old;
+      }
+      return { layer, entries };
     });
   }
 
-  private entryOf(record: OverlayRecord<H, C>, stack: StackData | null): Entry<H, C> {
-    if (record.entry && sameStack(record.entry.stack, stack)) return record.entry;
+  private entryOf(record: OverlayRecord<H, C>): Entry<H, C> {
+    if (record.entry) return record.entry;
     // Queued records are filtered out before this is called.
     const state = record.state as OverlayState;
-    // Keep the control object stable across prop-only and position-only updates.
+    // Keep the control object stable across prop-only updates.
     if (record.control?.state !== state) record.control = { state, ...record.fns };
     record.entry = {
       id: record.id,
@@ -409,7 +401,6 @@ export class OverlayStore<H, C> {
       component: record.request.component,
       props: record.props,
       control: record.control,
-      stack,
     };
     return record.entry;
   }

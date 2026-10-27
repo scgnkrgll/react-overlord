@@ -4,7 +4,7 @@ export interface User {
   job: string;
 }
 
-/** Module-level so callbacks captured at open() time always read the current toggle. */
+/** Lives at module level, so callbacks captured when open() runs always read the current toggle. */
 export const fakeServer = { failing: false };
 
 function request<T>(result: T, ms: number, signal?: AbortSignal): Promise<T> {

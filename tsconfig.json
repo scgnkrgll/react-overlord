@@ -12,7 +12,7 @@
     "isolatedModules": true,
     "allowImportingTsExtensions": true,
     "skipLibCheck": true,
-    "types": ["vitest/globals", "@testing-library/jest-dom"],
+    "types": ["node", "vitest/globals", "@testing-library/jest-dom"],
     // For the shadcn CLI, which resolves component aliases from here; demo/tsconfig.json has the real mapping.
     "paths": { "@/*": ["./demo/*"] }
   },

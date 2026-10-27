@@ -1,6 +1,6 @@
-import { useEffect } from "react";
 import { XIcon } from "lucide-react";
 import { useOverlay } from "../src";
+import { useStackItem } from "../src/stack.ts";
 import { Button } from "@/components/ui/button";
 import { cn } from "@/lib/utils";
 import { overlays } from "./overlays";
@@ -20,17 +20,11 @@ function Toast({
   tone?: "info" | "success" | "error";
   duration?: number;
 }) {
-  const { state, stack, dismiss, exited } = useOverlay(ToastOverlay);
+  const { id, state, dismiss, exited } = useOverlay(ToastOverlay);
+  const stack = useStackItem(id);
   const closing = state.phase === "closing";
 
   useCountdown(duration, stack.paused, dismiss);
-
-  // Fallback in case the exit transition doesn't run (e.g. the tab is in the background).
-  useEffect(() => {
-    if (!closing) return;
-    const timer = setTimeout(exited, 500);
-    return () => clearTimeout(timer);
-  }, [closing, exited]);
 
   return (
     <li
@@ -59,4 +53,5 @@ function Toast({
   );
 }
 
-export const ToastOverlay = overlays.createOverlay("toast", Toast, { exitTransition: true });
+// If the exit transition doesn't run, for example in a background tab, the toast is removed after 500ms.
+export const ToastOverlay = overlays.createOverlay("toast", Toast, { exitTransition: true, exitTimeout: 500 });

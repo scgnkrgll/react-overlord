@@ -1,3 +1,5 @@
+"use client";
+
 /**
  * Type-safe, headless manager for modals, menus, toasts and other overlays.
  *
@@ -10,6 +12,8 @@
  * });
  * ```
  *
+ * Toast piles that expand on hover live in the `react-overlord/stack` subpath.
+ *
  * @module
  */
 
@@ -19,26 +23,21 @@ export { useOverlay } from "./useOverlay.ts";
 export type {
   CreateOverlayOptions,
   LayerConfig,
+  LayerContainerProps,
+  LayerNames,
   OnSubmit,
   OpenArgs,
   OpenAsyncArgs,
   OpenAsyncOptions,
   OpenCallbacks,
   OverlayControl,
-  OverlayControlFor,
   OverlayHandle,
   OverlayInstance,
   OverlayManager,
   OverlayPhase,
   OverlayResult,
   OverlayState,
-  PlainLayerConfig,
-  PlainLayerName,
-  StackContainerProps,
-  StackGroup,
-  StackInfo,
-  StackLayerConfig,
-  StackLayerName,
+  OverlayView,
   SubmitContext,
   SubmitFn,
 } from "./types.ts";

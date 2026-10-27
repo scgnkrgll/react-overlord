@@ -14,8 +14,8 @@ export function SubmitError({ state }: { state: OverlayState }) {
 }
 
 /**
- * A shadcn (Base UI) Dialog driven by the overlay manager: it closes when the overlay enters `closing`, and calls
- * `onExited` once Base UI has finished the exit animation. Escape, outside clicks and the × button go through
+ * A shadcn Dialog, built on Base UI, that the overlay manager controls. It closes when the overlay enters `closing`
+ * and calls `onExited` after Base UI finishes the exit animation. Escape, outside clicks and the × button call
  * `onDismiss`, unless `canDismiss` is false.
  */
 export function Modal({

@@ -1,4 +1,4 @@
-import type { ComponentType, FocusEventHandler, PointerEventHandler, ReactNode } from "react";
+import type { ComponentType, ReactNode } from "react";
 
 /** The state an overlay reads from `useOverlay()`. */
 export type OverlayState =
@@ -16,54 +16,23 @@ interface BaseLayerConfig {
   readonly overflow?: "queue" | "dismiss-oldest";
 }
 
-export interface PlainLayerConfig extends BaseLayerConfig {
-  readonly stack?: false;
-  /** Wraps every overlay of this layer. Always rendered. */
-  readonly container?: ComponentType<{ children?: ReactNode }>;
-}
-
-/** A layer whose overlays form a pile that expands on hover or focus, like Ark UI toasts. */
-export interface StackLayerConfig extends BaseLayerConfig {
-  readonly stack: true;
-  /** Renders the group. Spread `group.props` on its root so hover and focus expand the pile. */
-  readonly container: ComponentType<StackContainerProps>;
-}
-
-export type LayerConfig = PlainLayerConfig | StackLayerConfig;
-
-/** Where an overlay sits in its stack layer. Only available for overlays in a stack layer. */
-export interface StackInfo {
-  /** 0 is the newest overlay, at the front of the pile. */
-  readonly index: number;
-  /** Number of active (not queued, not closing) overlays in the layer. */
-  readonly count: number;
-  /** True while the group is hovered or focused. */
-  readonly expanded: boolean;
-  /** True while expanded or while the page is hidden. Pause auto-dismiss timers on this. */
-  readonly paused: boolean;
-  /** Sum of the measured heights of the newer overlays, in px. Add your gap in CSS. */
-  readonly offset: number;
-  /** Attach to the overlay's root element so its height is measured. */
-  readonly ref: (element: HTMLElement | null) => void;
-}
-
-export interface StackGroup {
-  readonly expanded: boolean;
-  readonly count: number;
-  /** Height of the front overlay (index 0), for sizing the collapsed pile. */
-  readonly frontHeight: number;
-  /** Spread on the group's root element. */
-  readonly props: {
-    readonly onPointerEnter: PointerEventHandler<HTMLElement>;
-    readonly onPointerLeave: PointerEventHandler<HTMLElement>;
-    readonly onFocus: FocusEventHandler<HTMLElement>;
-    readonly onBlur: FocusEventHandler<HTMLElement>;
-  };
-}
-
-export interface StackContainerProps {
+/** Props the manager passes to a layer's `container`. */
+export interface LayerContainerProps {
+  /** The rendered overlays of this layer. */
   readonly children?: ReactNode;
-  readonly group: StackGroup;
+  /**
+   * Views of the same overlays, oldest first. Queued overlays are left out; closing ones are
+   * included. The array keeps its identity while nothing in the layer changes.
+   */
+  readonly overlays: ReadonlyArray<OverlayView>;
+}
+
+export interface LayerConfig extends BaseLayerConfig {
+  /**
+   * Wraps every overlay of this layer. Always rendered, so it works as an `aria-live` region.
+   * Receives the layer's overlays, which is what `useStack()` from "react-overlord/stack" reads.
+   */
+  readonly container?: ComponentType<LayerContainerProps>;
 }
 
 export interface CreateOverlayOptions {
@@ -72,6 +41,17 @@ export interface CreateOverlayOptions {
    * so it can play an exit animation. Without it, closing unmounts immediately.
    */
   readonly exitTransition?: boolean;
+  /**
+   * With `exitTransition`, removes the overlay this many ms after it starts closing, even if it
+   * never called `exited()`. Covers a missing `exited()` call and animations that don't run, such
+   * as in a background tab. Defaults to 1000. Pass `Infinity` to wait for `exited()` forever.
+   */
+  readonly exitTimeout?: number;
+  /**
+   * Name used in `useOverlay()` error messages. Defaults to the component's
+   * `displayName` or `name`, which minifiers can rename in production builds.
+   */
+  readonly displayName?: string;
 }
 
 type IsVoid<V> = [V] extends [void] ? true : false;
@@ -81,8 +61,11 @@ export interface SubmitContext {
   readonly signal: AbortSignal;
 }
 
-/** Return a promise to keep the overlay pending until it settles. A rejection moves it to `failed`. */
-export type OnSubmit<V> = (value: V, context: SubmitContext) => unknown;
+/**
+ * Return a promise to keep the overlay pending until it settles. A rejection moves it to `failed`.
+ * `openAsync()` puts the awaited return value in `result`.
+ */
+export type OnSubmit<V, R = unknown> = (value: V, context: SubmitContext) => R;
 
 interface BaseCallbacks {
   /** Called exactly once when the overlay closes for any reason other than a successful submit. */
@@ -105,28 +88,34 @@ export type OpenArgs<P, V> =
       : [props: P, callbacks?: OpenCallbacks<V>]
     : [props: P, callbacks: OpenCallbacks<V>];
 
-/** Options for `openAsync()`. The promise replaces `onDismiss`, and `onSubmit` becomes optional. */
-export interface OpenAsyncOptions<V> {
-  /** Return a promise to keep the overlay pending until it settles. `openAsync` resolves only after it succeeds. */
-  readonly onSubmit?: OnSubmit<V>;
+/** Options for `openAsync()`. The promise replaces `onDismiss`. */
+export interface OpenAsyncOptions<V, R = unknown> {
+  /** Its awaited return value becomes the result's `result`. A rejection keeps the overlay open in `failed`. */
+  readonly onSubmit?: OnSubmit<V, R>;
   /** Allow `dismiss()` while `onSubmit` is pending. The submit's signal is aborted. */
   readonly abortable?: boolean;
 }
 
 /** Arguments of `Handle.openAsync()`. Props are optional only when every prop is optional. */
-export type OpenAsyncArgs<P, V> = {} extends P
-  ? [props?: P, options?: OpenAsyncOptions<V>]
-  : [props: P, options?: OpenAsyncOptions<V>];
+export type OpenAsyncArgs<P, V, R = V> = {} extends P
+  ? [props?: P, options?: OpenAsyncOptions<V, R>]
+  : [props: P, options?: OpenAsyncOptions<V, R>];
 
-/** What `openAsync()` resolves to. It never rejects: a dismiss resolves with `submitted: false`. */
-export type OverlayResult<V> =
-  | { readonly submitted: true; readonly value: V }
+/**
+ * What `openAsync()` resolves to. It never rejects: a dismiss resolves with `submitted: false`.
+ * `value` is what the overlay submitted. `result` is what `onSubmit` returned, awaited, and
+ * `undefined` without `onSubmit`.
+ */
+export type OverlayResult<V, R = undefined> =
+  | { readonly submitted: true; readonly value: V; readonly result: R }
   | { readonly submitted: false };
 
 export type SubmitFn<V> = IsVoid<V> extends true ? () => void : (value: V) => void;
 
 /** What `useOverlay(Handle)` returns inside the overlay component. */
 export interface OverlayControl<V> {
+  /** This overlay's id, the same as in `useOverlays()`. Stable while it is open. */
+  readonly id: number;
   readonly state: OverlayState;
   /** Hands the value to the caller's `onSubmit`. Ignored unless the phase is `idle` or `failed`. */
   readonly submit: SubmitFn<V>;
@@ -135,10 +124,6 @@ export interface OverlayControl<V> {
   /** Tells the manager the exit animation finished. Only used with `exitTransition: true`. */
   readonly exited: () => void;
 }
-
-/** `useOverlay()`'s return type: overlays in a stack layer also get `stack`. */
-export type OverlayControlFor<V, S extends boolean> = OverlayControl<V> &
-  (S extends true ? { readonly stack: StackInfo } : unknown);
 
 /** A single open overlay, returned by `Handle.open()`. */
 export interface OverlayInstance<P> {
@@ -149,37 +134,51 @@ export interface OverlayInstance<P> {
 }
 
 /** Returned by `createOverlay`. The only way to open the overlay. */
-export interface OverlayHandle<P, V, S extends boolean = false> {
+export interface OverlayHandle<P, V> {
   readonly displayName: string;
   open(...args: OpenArgs<P, V>): OverlayInstance<P>;
   /**
-   * Opens the overlay and resolves once it closes: with the value after a successful submit,
-   * or with `submitted: false` after a dismiss. Use `open()` to update or dismiss it from outside.
+   * Opens the overlay and resolves once it closes. After a successful submit it resolves with the
+   * submitted `value` and the awaited `result` of `onSubmit`. A dismiss resolves with
+   * `submitted: false`. Use `open()` to update or dismiss it from outside.
    */
-  openAsync(...args: OpenAsyncArgs<P, V>): Promise<OverlayResult<V>>;
+  openAsync<R = undefined>(...args: OpenAsyncArgs<P, V, R>): Promise<OverlayResult<V, Awaited<R>>>;
   /** Type-only carrier for `useOverlay`. Never set at runtime. */
-  readonly "~types"?: { readonly props: P; readonly value: V; readonly stack: S };
+  readonly "~types"?: { readonly props: P; readonly value: V };
 }
 
-type LayerNames<Layers> = Extract<keyof Layers, string>;
-export type StackLayerName<Layers> = {
-  [K in LayerNames<Layers>]: Layers[K] extends { readonly stack: true } ? K : never;
-}[LayerNames<Layers>];
-export type PlainLayerName<Layers> = Exclude<LayerNames<Layers>, StackLayerName<Layers>>;
+/** A read-only view of an open overlay, returned by `getOverlays()` and `useOverlays()`. */
+export interface OverlayView<L extends string = string> {
+  readonly id: number;
+  readonly layer: L;
+  readonly handle: OverlayHandle<any, any>;
+  readonly props: unknown;
+  readonly state: OverlayState;
+}
+
+export type LayerNames<Layers> = Extract<keyof Layers, string>;
 
 export interface OverlayManager<Layers extends Record<string, LayerConfig>> {
   createOverlay<P, V = void>(
-    layer: StackLayerName<Layers>,
+    layer: LayerNames<Layers>,
     component: ComponentType<P>,
     options?: CreateOverlayOptions,
-  ): OverlayHandle<P, V, true>;
-  createOverlay<P, V = void>(
-    layer: PlainLayerName<Layers>,
-    component: ComponentType<P>,
-    options?: CreateOverlayOptions,
-  ): OverlayHandle<P, V, false>;
+  ): OverlayHandle<P, V>;
   /** Renders every open overlay. Mount once, inside your app's providers. */
   readonly Outlet: ComponentType;
   /** Dismisses every overlay, or only those in `layer`. Same rules as `dismiss()`. */
   dismissAll(layer?: LayerNames<Layers>): void;
+  /**
+   * Read-only views of every rendered overlay, for code outside React.
+   * Queued overlays are not included; closing ones are, with `phase: "closing"`.
+   */
+  getOverlays(): ReadonlyArray<OverlayView<LayerNames<Layers>>>;
+  /** Reactive `getOverlays()`: re-renders when any overlay opens, changes state or closes. */
+  useOverlays(): ReadonlyArray<OverlayView<LayerNames<Layers>>>;
+  /**
+   * Removes every overlay at once, for tests. Unlike `dismissAll()`, it calls no callbacks,
+   * skips exit animations, and aborts pending submits. Pending `openAsync()` promises
+   * resolve with `submitted: false`.
+   */
+  reset(): void;
 }

@@ -1,27 +1,27 @@
 import {
   Fragment,
   memo,
-  useEffect,
   useMemo,
   useSyncExternalStore,
   type ComponentType,
-  type FocusEvent,
+  type ReactNode,
 } from "react";
 import { InstanceContext, type InstanceContextValue } from "./context.ts";
-import { OverlayStore, type Callbacks, type Entry } from "./store.ts";
+import { OverlayStore, type Callbacks, type Entry, type LayerSnapshot } from "./store.ts";
 import type {
   CreateOverlayOptions,
   LayerConfig,
+  LayerContainerProps,
+  LayerNames,
+  OpenAsyncOptions,
   OverlayHandle,
   OverlayInstance,
   OverlayManager,
   OverlayResult,
-  OpenAsyncOptions,
-  StackGroup,
-  StackInfo,
+  OverlayView,
 } from "./types.ts";
 
-type AnyHandle = OverlayHandle<unknown, unknown, boolean>;
+type AnyHandle = OverlayHandle<any, any>;
 type AnyComponent = ComponentType<Record<string, unknown>>;
 
 export interface OverlayManagerConfig<Layers extends Record<string, LayerConfig>> {
@@ -33,7 +33,6 @@ export function createOverlayManager<const Layers extends Record<string, LayerCo
   config: OverlayManagerConfig<Layers>,
 ): OverlayManager<Layers> {
   const store = new OverlayStore<AnyHandle, AnyComponent>(config.layers);
-  const hasStackLayer = Object.values(config.layers).some((layer) => layer.stack);
 
   function createOverlay(
     layer: string,
@@ -49,11 +48,12 @@ export function createOverlayManager<const Layers extends Record<string, LayerCo
         handle,
         component: component as AnyComponent,
         exitTransition: options.exitTransition ?? false,
+        exitTimeout: options.exitTimeout,
         props: props ?? {},
         callbacks,
       });
     const handle: AnyHandle = {
-      displayName: component.displayName ?? (component.name || "Overlay"),
+      displayName: options.displayName ?? component.displayName ?? (component.name || "Overlay"),
       open(props?: unknown, callbacks?: Callbacks): OverlayInstance<unknown> {
         const id = start(props, callbacks ?? {});
         return {
@@ -62,12 +62,13 @@ export function createOverlayManager<const Layers extends Record<string, LayerCo
         };
       },
       openAsync(props?: unknown, { onSubmit, abortable }: OpenAsyncOptions<unknown> = {}) {
-        return new Promise<OverlayResult<unknown>>((resolve) => {
+        return new Promise<OverlayResult<any, any>>((resolve) => {
           start(props, {
             onSubmit,
             abortable,
-            onSubmitted: (value) => resolve({ submitted: true, value }),
+            onSubmitted: (value, result) => resolve({ submitted: true, value, result }),
             onDismiss: () => resolve({ submitted: false }),
+            onReset: () => resolve({ submitted: false }),
           });
         });
       },
@@ -75,69 +76,45 @@ export function createOverlayManager<const Layers extends Record<string, LayerCo
     return handle;
   }
 
-  // One set of group handlers per stack layer, so containers get stable props.
-  const groupProps = new Map<string, StackGroup["props"]>();
-  for (const [layer, layerConfig] of Object.entries(config.layers)) {
-    if (!layerConfig.stack) continue;
-    groupProps.set(layer, {
-      onPointerEnter: () => store.setExpanded(layer, true),
-      onPointerLeave: () => store.setExpanded(layer, false),
-      onFocus: () => store.setExpanded(layer, true),
-      onBlur: (event: FocusEvent<HTMLElement>) => {
-        // Moving focus between toasts in the group keeps it expanded.
-        if (!event.currentTarget.contains(event.relatedTarget as Node | null)) store.setExpanded(layer, false);
-      },
-    });
-  }
-
-  // One ResizeObserver per manager measures every stacked overlay.
-  const ids = new WeakMap<Element, number>();
-  let observer: ResizeObserver | null = null;
-  const measure = (id: number, element: HTMLElement | null, previous: HTMLElement | null) => {
-    if (previous) observer?.unobserve(previous);
-    if (!element) return;
-    ids.set(element, id);
-    // offsetHeight ignores transforms, so a scaled-down toast in the pile still reports its real height.
-    store.setHeight(id, element.offsetHeight);
-    if (typeof ResizeObserver === "undefined") return;
-    observer ??= new ResizeObserver((records) => {
-      const heights: [number, number][] = [];
-      for (const record of records) {
-        const target = record.target as HTMLElement;
-        const recordId = ids.get(target);
-        if (recordId !== undefined) heights.push([recordId, record.borderBoxSize[0]?.blockSize ?? target.offsetHeight]);
-      }
-      store.setHeights(heights); // one snapshot and re-render for everything that resized together
-    });
-    observer.observe(element);
+  // One view array per layer snapshot. Layer snapshots keep their identity while unchanged,
+  // so the views (and the containers that read them) do too.
+  const layerViews = new WeakMap<LayerSnapshot<AnyHandle, AnyComponent>, ReadonlyArray<OverlayView>>();
+  const viewsOf = (layer: LayerSnapshot<AnyHandle, AnyComponent>) => {
+    let views = layerViews.get(layer);
+    if (!views) {
+      views = layer.entries.map((entry) => ({
+        id: entry.id,
+        layer: layer.layer,
+        handle: entry.handle,
+        props: entry.props,
+        state: entry.control.state,
+      }));
+      layerViews.set(layer, views);
+    }
+    return views;
   };
+  const toViews = (snapshot: ReadonlyArray<LayerSnapshot<AnyHandle, AnyComponent>>) =>
+    snapshot.flatMap(viewsOf) as unknown as ReadonlyArray<OverlayView<LayerNames<Layers>>>;
+
+  function useOverlays() {
+    const snapshot = useSyncExternalStore(store.subscribe, store.getSnapshot, store.getSnapshot);
+    // The snapshot is referentially stable while nothing changed, and so is this view.
+    return useMemo(() => toViews(snapshot), [snapshot]);
+  }
 
   function Outlet() {
     const layers = useSyncExternalStore(store.subscribe, store.getSnapshot, store.getSnapshot);
-
-    useEffect(() => {
-      if (!hasStackLayer || typeof document === "undefined") return;
-      const sync = () => store.setPageHidden(document.visibilityState === "hidden");
-      sync();
-      document.addEventListener("visibilitychange", sync);
-      return () => document.removeEventListener("visibilitychange", sync);
-    }, []);
-
     return (
       <>
-        {layers.map(({ layer, entries, group }) => {
-          const children = entries.map((entry) => <InstanceView key={entry.id} entry={entry} measure={measure} />);
-          const layerConfig = store.layerConfig(layer)!;
-          if (layerConfig.stack) {
-            const Container = layerConfig.container;
-            return (
-              <Container key={layer} group={{ ...group!, props: groupProps.get(layer)! }}>
-                {children}
-              </Container>
-            );
-          }
-          const Container = layerConfig.container ?? Fragment;
-          return <Container key={layer}>{children}</Container>;
+        {layers.map((layer) => {
+          const children = layer.entries.map((entry) => <InstanceView key={entry.id} entry={entry} />);
+          const Container = store.layerConfig(layer.layer)!.container as ComponentType<LayerContainerProps> | undefined;
+          if (!Container) return <Fragment key={layer.layer}>{children}</Fragment>;
+          return (
+            <Container key={layer.layer} overlays={viewsOf(layer)}>
+              {children}
+            </Container>
+          );
         })}
       </>
     );
@@ -147,36 +124,16 @@ export function createOverlayManager<const Layers extends Record<string, LayerCo
     createOverlay: createOverlay as OverlayManager<Layers>["createOverlay"],
     Outlet,
     dismissAll: (layer) => store.dismissAll(layer),
+    getOverlays: () => toViews(store.getSnapshot()),
+    useOverlays,
+    reset: () => store.reset(),
   };
 }
 
-type Measure = (id: number, element: HTMLElement | null, previous: HTMLElement | null) => void;
-
 /** Re-renders only when this overlay's entry changes, not when another overlay does. */
-const InstanceView = memo(function InstanceView({
-  entry,
-  measure,
-}: {
-  entry: Entry<AnyHandle, AnyComponent>;
-  measure: Measure;
-}) {
-  const { id, handle, control, stack, component: Component } = entry;
-
-  // Stable for the overlay's lifetime (InstanceView is keyed by id).
-  const ref = useMemo(() => {
-    let current: HTMLElement | null = null;
-    return (element: HTMLElement | null) => {
-      measure(id, element, current);
-      current = element;
-    };
-  }, [id, measure]);
-
-  // Stable across prop-only updates, so `useOverlay` consumers only re-render on state or position changes.
-  const stackInfo = useMemo<StackInfo | null>(() => (stack ? { ...stack, ref } : null), [stack, ref]);
-  const value = useMemo<InstanceContextValue>(
-    () => ({ handle, overlay: stackInfo ? { ...control, stack: stackInfo } : control }),
-    [handle, control, stackInfo],
-  );
+const InstanceView = memo(function InstanceView({ entry }: { entry: Entry<AnyHandle, AnyComponent> }) {
+  const { handle, control, component: Component } = entry;
+  const value = useMemo<InstanceContextValue>(() => ({ handle, overlay: control }), [handle, control]);
   return (
     <InstanceContext.Provider value={value}>
       <Component {...(entry.props as Record<string, unknown>)} />
